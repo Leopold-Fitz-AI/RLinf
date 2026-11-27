@@ -474,24 +474,8 @@ class Pi0(model.BaseModel):
         return self.action_out_proj(suffix_out_act.to(dtype=torch.float32))
 
     def to_bfloat16_for_selected_params(self, precision: str = "bfloat16") -> None:
-        """OpenPI ``PaliGemmaWithExpertModel.to_bfloat16_for_selected_params``.
-
-        OpenPI calls ``self.to(dtype)`` on ``paligemma_with_expert`` only
-        (SigLIP + PaliGemma Gemma + action-expert Gemma), then restores a
-        subset of those weights to fp32. Action / value heads live outside
-        that module and must not be converted — so this uses ``llm`` +
-        ``img``, never ``self.to()``.
-        """
-        # Same branch order as OpenPI: bf16 converts then falls through to
-        # the fp32 restore; float32 converts and returns.
-        if precision == "bfloat16":
-            self.llm.to(dtype=torch.bfloat16)
-            self.img.to(dtype=torch.bfloat16)
-        elif precision == "float32":
-            self.llm.to(dtype=torch.float32)
-            self.img.to(dtype=torch.float32)
-            return
-        else:
+        """Set backbone precision while preserving FP32 islands and heads."""
+        if precision not in ("bfloat16", "float32"):
             raise ValueError(f"Invalid precision: {precision}")
 
         # 1:1 with OpenPI's substring list. Names come from
@@ -516,8 +500,13 @@ class Pi0(model.BaseModel):
         for name, param in self.named_parameters():
             if not (name.startswith("llm.") or name.startswith("img.")):
                 continue
-            if any(selector in name for selector in params_to_keep_float32):
-                param.data = param.data.to(dtype=torch.float32)
+            keep_float32 = precision == "float32" or any(
+                selector in name for selector in params_to_keep_float32
+            )
+            dtype = torch.float32 if keep_float32 else torch.bfloat16
+            # FP32 islands must never pass through BF16 after checkpoint load.
+            if param.dtype != dtype:
+                param.data = param.data.to(dtype=dtype)
 
     def sample_actions(
         self,
@@ -752,7 +741,10 @@ class Pi0(model.BaseModel):
         )
 
     def _reduce_sft_loss(
-        self, per_element_loss: torch.Tensor, use_action_chunk_loss: bool
+        self,
+        per_element_loss: torch.Tensor,
+        use_action_chunk_loss: bool,
+        action_loss_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Mean flow-matching MSE, optionally restricted to the env action chunk.
 
@@ -760,6 +752,19 @@ class Pi0(model.BaseModel):
         matches the old OpenPI wrapper by dropping padded action dims and
         unexecuted horizon steps before the mean.
         """
+        if action_loss_mask is not None:
+            action_loss_mask = torch.as_tensor(
+                action_loss_mask, device=per_element_loss.device
+            )
+            if (
+                action_loss_mask.dtype != torch.bool
+                or action_loss_mask.shape != per_element_loss.shape
+            ):
+                raise ValueError(
+                    "Expected boolean action_loss_mask with shape "
+                    f"{tuple(per_element_loss.shape)}, got "
+                    f"{action_loss_mask.dtype} {tuple(action_loss_mask.shape)}."
+                )
         if use_action_chunk_loss:
             horizon = (
                 self.action_chunk
@@ -772,6 +777,12 @@ class Pi0(model.BaseModel):
                 else per_element_loss.shape[-1]
             )
             per_element_loss = per_element_loss[:, :horizon, :env_dim]
+            if action_loss_mask is not None:
+                action_loss_mask = action_loss_mask[:, :horizon, :env_dim]
+        if action_loss_mask is not None:
+            if not action_loss_mask.any():
+                raise ValueError("Expected at least one supervised action element.")
+            return per_element_loss.masked_select(action_loss_mask).mean()
         return per_element_loss.mean()
 
     def _sft_forward_with_rlt_prefix(
@@ -826,19 +837,30 @@ class Pi0(model.BaseModel):
     def sft_forward(
         self, data: Any, use_action_chunk_loss: bool = False, **kwargs
     ) -> torch.Tensor | dict[str, torch.Tensor]:
-        """Flow-matching SFT loss. Shared by SFT, DAgger, and PPO co-train."""
+        """Flow-matching SFT loss with an optional boolean action_loss_mask.
+
+        Dict batches may mask episode boundaries and padded dimensions using
+        a mask matching the normalized actions, shaped [B, horizon, action_dim].
+        """
         del kwargs
+        action_loss_mask = (
+            data.get("action_loss_mask") if isinstance(data, dict) else None
+        )
         observation, actions = self._unpack_sft_batch(data)
         observation = self._observation_to_device(observation)
         actions = self._actions_to_device(actions)
         if not self.rlt_cfg.use_rlt:
             per_element_loss = self.compute_loss(observation, actions, train=True)
-            return self._reduce_sft_loss(per_element_loss, use_action_chunk_loss)
+            return self._reduce_sft_loss(
+                per_element_loss, use_action_chunk_loss, action_loss_mask
+            )
 
         per_element_loss, prefix_output, prefix_mask = (
             self._sft_forward_with_rlt_prefix(observation, actions)
         )
-        vla_loss = self._reduce_sft_loss(per_element_loss, use_action_chunk_loss)
+        vla_loss = self._reduce_sft_loss(
+            per_element_loss, use_action_chunk_loss, action_loss_mask
+        )
         rlt_loss, _ = self._rlt_forward(prefix_output, prefix_mask)
         return {
             "loss": rlt_loss + self.rlt_cfg.rlt_alpha * vla_loss,

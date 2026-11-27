@@ -2533,3 +2533,98 @@ def test_lingbotvlav2_smoke_config_composes(monkeypatch):
     )
     assert cfg.algorithm.adv_type == "gae" and cfg.algorithm.loss_type == "actor_critic"
     assert cfg.runner.max_steps == 2 and cfg.env.train.total_num_envs == 4
+
+
+@pytest.mark.parametrize("precision", ["bfloat16", "float32"])
+def test_openpi_precision_preserves_fp32_weights_on_reload(precision, tmp_path):
+    from rlinf.models.embodiment.openpi.pi0 import Pi0
+
+    def policy():
+        model = Pi0.__new__(Pi0)
+        torch.nn.Module.__init__(model)
+        model.llm = torch.nn.ModuleDict(
+            {
+                "projection": torch.nn.Linear(4, 4),
+                "pre_attention_norms": torch.nn.Linear(4, 4),
+                "pre_ffw_norms": torch.nn.Linear(4, 4),
+                "final_norms": torch.nn.Linear(4, 4),
+            }
+        )
+        model.img = torch.nn.ModuleDict(
+            {"stem": torch.nn.Linear(4, 4), "encoder": torch.nn.Linear(4, 4)}
+        )
+        model.img.register_parameter(
+            "pos_embedding", torch.nn.Parameter(torch.full((4,), 0.100123))
+        )
+        model.action_out_proj = torch.nn.Linear(4, 4)
+        with torch.no_grad():
+            for param in model.parameters():
+                param.fill_(0.100123)
+        return model
+
+    model = policy()
+    before = {name: param.clone() for name, param in model.named_parameters()}
+    model.to_bfloat16_for_selected_params(precision)
+    for name, param in model.named_parameters():
+        low_precision = precision == "bfloat16" and name.startswith(
+            ("llm.projection.", "img.encoder.")
+        )
+        dtype = torch.bfloat16 if low_precision else torch.float32
+        assert param.dtype == dtype
+        assert torch.equal(param, before[name].to(dtype))
+
+    checkpoint = tmp_path / "policy.pt"
+    torch.save(model.state_dict(), checkpoint)
+    restored = policy()
+    restored.load_state_dict(torch.load(checkpoint, weights_only=True))
+    restored.to_bfloat16_for_selected_params(precision)
+    for name, param in restored.named_parameters():
+        assert torch.equal(param, model.state_dict()[name])
+
+
+def test_openpi_sft_action_mask_excludes_boundaries_and_padding():
+    from rlinf.models.embodiment.openpi.pi0 import Pi0
+
+    policy = Pi0.__new__(Pi0)
+    torch.nn.Module.__init__(policy)
+    policy.action_chunk = 4
+    policy.action_env_dim = 8
+    errors = torch.arange(2 * 16 * 32, dtype=torch.float32).reshape(2, 16, 32)
+    errors.requires_grad_()
+    mask = torch.zeros_like(errors, dtype=torch.bool)
+    mask[0, :2, :8] = True
+    mask[1, :6, :8] = True
+    loss = policy._reduce_sft_loss(errors, False, mask)
+    expected = torch.cat(
+        (errors[0, :2, :8].flatten(), errors[1, :6, :8].flatten())
+    ).mean()
+    torch.testing.assert_close(loss, expected)
+    loss.backward()
+    assert torch.count_nonzero(errors.grad[~mask]) == 0
+    torch.testing.assert_close(errors.grad[mask], torch.full((64,), 1 / 64))
+    chunk_loss = policy._reduce_sft_loss(errors.detach(), True, mask)
+    expected_chunk = torch.cat(
+        (errors[0, :2, :8].flatten(), errors[1, :4, :8].flatten())
+    ).mean()
+    torch.testing.assert_close(chunk_loss, expected_chunk)
+    torch.testing.assert_close(
+        policy._reduce_sft_loss(errors.detach(), False), errors.detach().mean()
+    )
+
+
+@pytest.mark.parametrize("invalid", ["shape", "dtype", "empty"])
+def test_openpi_sft_rejects_invalid_action_loss_mask(invalid):
+    from rlinf.models.embodiment.openpi.pi0 import Pi0
+
+    policy = Pi0.__new__(Pi0)
+    torch.nn.Module.__init__(policy)
+    losses = torch.ones(2, 16, 32)
+    mask = torch.ones_like(losses, dtype=torch.bool)
+    if invalid == "shape":
+        mask = mask[:, :, :8]
+    elif invalid == "dtype":
+        mask = mask.float()
+    else:
+        mask.zero_()
+    with pytest.raises(ValueError):
+        policy._reduce_sft_loss(losses, False, mask)
