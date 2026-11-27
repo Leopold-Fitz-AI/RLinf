@@ -1,0 +1,96 @@
+defaults:
+- model/pi0_5@actor.model
+- hybrid_engines/openpi_fsdp@actor.fsdp_config
+- _self_
+- override hydra/job_logging: stdout
+hydra:
+  searchpath:
+  - file:///vla-cd/jy/v12b_usb_cycle_v1/clean_rel256_phase13_v1/rlinf/examples/sft/config
+  run:
+    dir: .
+  output_subdir: null
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor: 0-7
+runner:
+  task_type: sft
+  logger:
+    log_path: /vla-cd/jy/v12b_usb_cycle_v1/holder_v2_rlt/stage1_pi05_rlt/pi05_v3_fresh_joint_rlt_s1
+    project_name: usb_holder_v2_rlt
+    experiment_name: pi05_v3_fresh_joint_rlt_s1
+    logger_backends:
+    - tensorboard
+  max_epochs: 100000
+  max_steps: 2500
+  val_check_interval: -1
+  save_interval: 500
+data:
+  train_data_paths: /mlplatform/jy/v3_fresh_nvme/train_v3_fresh_plus_dagger
+  num_workers: 4
+actor:
+  group_name: USBV3FreshJointRLTS1
+  training_backend: fsdp
+  micro_batch_size: 8
+  eval_batch_size: 1
+  global_batch_size: 64
+  seed: 7411
+  model:
+    model_path: /vla-cd/jy/v12b_usb_cycle_v1/holder_v2_rlt/stage1_pi05_rlt/warmstart_v3_fresh_s14k_rltinit
+    precision: fp32
+    num_action_chunks: 4
+    action_dim: 8
+    add_value_head: false
+    num_steps: 5
+    openpi:
+      task: sft
+      config_name: pi05_usb_rel256_phase12
+      num_images_in_input: 3
+      action_horizon: 16
+      action_chunk: 4
+      action_env_dim: 8
+      model_action_dim: 32
+      max_token_len: 200
+      discrete_state_input: true
+      train_expert_only: false
+      embed_dtype: bf16
+      use_rlt: true
+      rlt_alpha: 1.0
+      rlt_input_dim: 2048
+      rlt_embed_dim: 2048
+      rlt_prefix_seq_len: 1024
+      rlt_num_layers: 2
+      rlt_num_heads: 8
+      rlt_mlp_ratio: 4.0
+      rlt_image_only: false
+      rlt_use_mask: true
+    openpi_data:
+      norm_stats_path: /vla-cd/jy/v12b_usb_cycle_v1/holder_v2_rlt/assets/v3_fresh/norm_stats.json
+  optim:
+    lr: 1.5e-05
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-08
+    weight_decay: 1.0e-10
+    clip_grad: 1.0
+    total_training_steps: 2500
+    lr_warmup_steps: 120
+    lr_scheduler: openpi_cosine
+    min_lr: 1.5e-06
+  fsdp_config:
+    strategy: fsdp
+    sharding_strategy: full_shard
+    use_orig_params: true
+    gradient_checkpointing: true
+    save_full_model_weights: false
+    wrappers:
+      rlt_features:
+        module_names:
+        - rlt_module
+        wrap_mode: subtree
+    mixed_precision_rules:
+      rlt_features: fp32
+    mixed_precision:
+      param_dtype: bf16
+      reduce_dtype: fp32
+      buffer_dtype: fp32
