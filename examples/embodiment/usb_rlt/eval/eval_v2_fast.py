@@ -150,7 +150,8 @@ class SafeFingerGuardMixin:
                 self.p4_entry_z = float(raw14[2])
             if (self.p4_entry_z - float(raw14[2])) < 0.014:
                 block_p4 = True
-            if self.min_grasp_z < 10.0 and (float(raw14[2]) - self.min_grasp_z) > 0.0058:
+            deep_desc = (self.p4_entry_z - float(raw14[2])) >= 0.021 and float(raw14[2]) <= 0.8038
+            if (not deep_desc) and self.min_grasp_z < 10.0 and (float(raw14[2]) - self.min_grasp_z) > 0.0058:
                 block_p4 = True
         return None, None, block_p2, block_p4
 
@@ -266,13 +267,14 @@ class SafePhase12SwitcherV2(NonPrivilegedPhase12Switcher, SafeFingerGuardMixin):
                 and (0.365 <= tcp[0] <= 0.420)
                 and (-0.185 <= tcp[1] <= -0.130)
                 and (0.7945 <= tcp[2] <= 0.8048)
-                and z_drop5 <= (0.00008 if float(tcp[2]) > 0.8006 else 0.00025)
-                and (dq5 < 0.0035 or (dtcp5 < 0.00070 and dz5 < 0.00030))
+                and z_drop5 <= (0.00008 if float(tcp[2]) > 0.8006 else 0.00018)
+                and (dq5 < 0.0035 or (dtcp5 < 0.00070 and dz5 < 0.00035))
             ):
                 self.settle_steps += 1
             else:
                 self.settle_steps = 0
-            if self.settle_steps >= 33:
+            req_p4_settle = 52 if (0.8006 < float(tcp[2]) <= 0.8018) else 35
+            if self.settle_steps >= req_p4_settle:
                 self.min_dock_z = float(tcp[2])
                 self.p4_zslip_settle = 0
                 self._advance(step, 5, "seated_in_dock", st21)
@@ -319,18 +321,27 @@ class SafePhase12SwitcherV2(NonPrivilegedPhase12Switcher, SafeFingerGuardMixin):
 
         elif self.phase == 7:
             z_rel_ok = (
-                (-0.0063 <= float(tcp[2]) - self.min_grasp_z <= 0.0052)
+                (-0.0063 <= float(tcp[2]) - self.min_grasp_z <= 0.0080)
                 if self.min_grasp_z < 10.0
                 else (float(tcp[2]) <= 0.8045)
             )
             in_holder_xy = (0.345 <= float(tcp[0]) <= 0.406) and (-0.295 <= float(tcp[1]) <= -0.236)
             in_holder_z = (0.7900 <= float(tcp[2]) <= 0.8060)
+            if in_holder_xy and in_holder_z:
+                self.p7_reached_bottom = True
+            # If the finger safety clamp already released the plug inside the holder, advance to P8
+            # immediately instead of re-closing an empty gripper in mid-air.
+            if getattr(self, "p7_reached_bottom", False) and (grip < 0.25 or fq_sum < 0.00085):
+                self._advance(step, 8, "released_after_holder_seat", st21)
+                self.p7_bottom_settle = 0
+                self.p7_fq_settle = 0
+                return self.phase
             seated_basic = (grip >= 0.80 and fq_sum >= 0.00105 and in_holder_xy and in_holder_z and z_rel_ok and dq5 < 0.0025)
             if seated_basic:
                 self.settle_steps += 1
             else:
                 self.settle_steps = 0
-            if self.settle_steps >= 12:
+            if self.settle_steps >= 7:
                 self._advance(step, 8, "seated_in_holder", st21)
                 self.p7_bottom_settle = 0
             else:
@@ -344,7 +355,7 @@ class SafePhase12SwitcherV2(NonPrivilegedPhase12Switcher, SafeFingerGuardMixin):
                     and dtcp5 < 0.00075
                 )
                 self.p7_bottom_settle = (self.p7_bottom_settle + 1) if seated_floor else 0
-                if self.p7_bottom_settle >= 14:
+                if self.p7_bottom_settle >= 7:
                     self._advance(step, 8, "seated_in_holder_floor", st21)
                     self.p7_bottom_settle = 0
                 elif grip >= 0.80 and in_holder_xy and in_holder_z and z_rel_ok and fq_min < 0.00010 and dz5 < 0.00050:
