@@ -198,6 +198,9 @@ def main() -> None:
             pending: list[np.ndarray] = []
             cached_z = cached_ref_rel32 = None
             steps_since_vla = 999
+            phase_step = 0
+            p4_unjam_retries = 0
+            p4_unjam_lift = 0
             q_tgt: np.ndarray | None = None
             pending_dq: list[np.ndarray] = []
 
@@ -214,6 +217,7 @@ def main() -> None:
             tau_p4_free = np.asarray(task.d.actuator_force[rcu.ARM_ACT_SLICE], dtype=np.float64).copy()
             prev_act6 = np.zeros(6, dtype=np.float32)
             stall_steps = 0
+            prev_fq_min = 0.050
 
             min_lat_p4 = float("inf")
             max_dep_p4 = float("-inf")
@@ -236,6 +240,10 @@ def main() -> None:
                         tcp_z_hist.pop(0)
                     stall_steps = (stall_steps + 1) if float(np.linalg.norm(q_cur_f - q_hist[0])) < 0.0020 else 0
                 fq_margin = np.asarray(task.d.qpos[task.fq] - task.finger_lower, dtype=np.float32)
+                fq_min_now = float(np.min(fq_margin))
+                fq_min_vel = fq_min_now - prev_fq_min
+                fq_slam_guard = (fq_min_vel < -0.0005) and ((fq_min_now + fq_min_vel) < 0.00010)
+                prev_fq_min = fq_min_now
                 st21 = usb12.make_state21(raw_st, q_home0)
                 new_phase, cmd_ov = sw.step_update(i, st21, fq_margin, q_home0)
                 if new_phase != cur_phase:
@@ -259,6 +267,9 @@ def main() -> None:
                     pending_dq.clear()
                     cached_z = cached_ref_rel32 = None
                     steps_since_vla = 999
+                    phase_step = 0
+                    p4_unjam_retries = 0
+                    p4_unjam_lift = 0
                     q_tgt = raw_st[6:13].astype(np.float64).copy()
                     tcp_entry = raw_st[:3].astype(np.float32).copy()
                     last_cmd_q7 = raw_st[6:13].astype(np.float32).copy()
@@ -320,7 +331,7 @@ def main() -> None:
                         cmd = np.zeros(8, dtype=np.float32)
                         cmd[:7] = q_tgt.astype(np.float32)
                         cmd[7] = 0.98
-                        if (float(np.min(fq_margin)) < 0.00018 and float(np.sum(fq_margin)) < 0.00085) or float(np.min(fq_margin)) < 0.00010:
+                        if (fq_min_now < 0.00018 and float(np.sum(fq_margin)) < 0.00085) or fq_min_now < 0.00010 or fq_slam_guard:
                             cmd[7] = 0.0
                         steps_since_vla += 1
                     else:
@@ -354,67 +365,99 @@ def main() -> None:
                         cmd = np.zeros(8, dtype=np.float32)
                         cmd[:7] = q_cmd.astype(np.float32)
                         cmd[7] = 0.98 if cur_phase == 6 else 0.0
-                        if cmd[7] >= 0.85 and ((float(np.min(fq_margin)) < 0.00018 and float(np.sum(fq_margin)) < 0.00085) or float(np.min(fq_margin)) < 0.00010):
+                        if cmd[7] >= 0.85 and ((fq_min_now < 0.00018 and float(np.sum(fq_margin)) < 0.00085) or fq_min_now < 0.00010 or fq_slam_guard):
                             cmd[7] = 0.0
                         steps_since_vla += 1
                 elif use_actor is not None:
                     if q_tgt is None:
                         q_tgt = raw_st[6:13].astype(np.float64).copy()
-                    if not pending_dq:
-                        cur_prov = p4_provider if cur_phase == 4 else (p7_provider if cur_phase == 7 else provider)
-                        if cached_z is None or steps_since_vla >= use_cfg["vla_stride"]:
-                            cached_z, _, cached_ref_rel32 = cur_prov.infer(
-                                obs, q_home0, cur_phase, step_seed=7317 + i, flow_m=use_cfg["flow_m"]
+                    # Non-privileged P4 rim-unjam retry: if stuck ABOVE the socket rim
+                    # (never after descending >= 15mm into the socket!), lift straight up ~12mm via
+                    # robot URDF Jacobian and reset phase_step for a clean visual re-alignment.
+                    p4_above_rim = sw.p4_entry_z is None or (sw.p4_entry_z - float(raw_st[2])) < 0.015
+                    if cur_phase == 4 and p4_unjam_lift == 0 and p4_unjam_retries < 2 and phase_step >= 240 and sw.settle_steps < 5 and p4_above_rim:
+                        p4_unjam_retries += 1
+                        p4_unjam_lift = 12
+                        pending_dq.clear()
+                        cached_z = cached_ref_rel32 = None
+                        steps_since_vla = 999
+                        phase_step = 0
+                        stall_steps = 0
+                        prev_act6 = np.zeros(6, dtype=np.float32)
+                    if cur_phase == 4 and p4_unjam_lift > 0:
+                        p4_unjam_lift -= 1
+                        lift_act = np.array([0.0, 0.0, 1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+                        dq_up = step_persistent_qtgt_dq(
+                            task, lift_act, scale_xyz_m=0.0012, scale_rot_rad=0.0, max_dq_rad=0.020, exact_nullspace=True
+                        )
+                        q_cur = raw_st[6:13].astype(np.float64)
+                        q_tgt = q_cur + np.clip((q_tgt + dq_up) - q_cur, -0.020, 0.020)
+                        cmd = np.zeros(8, dtype=np.float32)
+                        cmd[:7] = q_tgt.astype(np.float32)
+                        cmd[7] = 0.98
+                        if (fq_min_now < 0.00018 and float(np.sum(fq_margin)) < 0.00085) or fq_min_now < 0.00010 or fq_slam_guard:
+                            cmd[7] = 0.0
+                        if p4_unjam_lift == 0:
+                            q_tgt = raw_st[6:13].astype(np.float64).copy()
+                            tcp_entry = raw_st[:3].astype(np.float32).copy()
+                            sw.p4_entry_z = float(raw_st[2])
+                    else:
+                        if not pending_dq:
+                            cur_prov = p4_provider if cur_phase == 4 else (p7_provider if cur_phase == 7 else provider)
+                            if cached_z is None or steps_since_vla >= use_cfg["vla_stride"]:
+                                cached_z, _, cached_ref_rel32 = cur_prov.infer(
+                                    obs, q_home0, cur_phase, step_seed=7317 + phase_step, flow_m=use_cfg["flow_m"]
+                                )
+                                steps_since_vla = 0
+                            w_crop = extract_wrist_128(task, obs, hires_wrist=use_cfg["hires_wrist_roi"])
+                            f_crop = extract_front_96(task, obs, subtask_name, hires_front=use_cfg["hires_front_roi"])
+                            l_crop = extract_left_96(task, obs, subtask_name, hires_left=use_cfg["hires_left_roi"])
+                            p_feat = rcu.extract_contact_proprio(
+                                task, raw_st, last_cmd_q7, q_hist[0], tcp_entry, stall_steps, prev_act6
                             )
-                            steps_since_vla = 0
-                        w_crop = extract_wrist_128(task, obs, hires_wrist=use_cfg["hires_wrist_roi"])
-                        f_crop = extract_front_96(task, obs, subtask_name, hires_front=use_cfg["hires_front_roi"])
-                        l_crop = extract_left_96(task, obs, subtask_name, hires_left=use_cfg["hires_left_roi"])
-                        p_feat = rcu.extract_contact_proprio(
-                            task, raw_st, last_cmd_q7, q_hist[0], tcp_entry, stall_steps, prev_act6
-                        )
-                        with torch.no_grad():
-                            l_t = torch.from_numpy(l_crop[None]).to(device) if l_crop is not None else None
-                            act6 = use_actor(
-                                torch.from_numpy(cached_z[None]).to(device),
-                                torch.from_numpy(p_feat[None]).to(device),
-                                torch.from_numpy(cached_ref_rel32[None]).to(device),
-                                torch.from_numpy(w_crop[None]).to(device),
-                                torch.from_numpy(f_crop[None]).to(device),
-                                l_t,
-                            )[0].cpu().numpy().astype(np.float32)
-                        dq = step_persistent_qtgt_dq(
-                            task, act6,
-                            scale_xyz_m=use_cfg["scale_xyz_m"],
-                            scale_rot_rad=use_cfg["scale_rot_rad"],
-                            max_dq_rad=0.025,
-                            exact_nullspace=use_cfg["exact_nullspace"],
-                        )
-                        prev_act6 = act6.copy()
-                        pending_dq = [0.5 * dq, 0.5 * dq]
-                    q_cur = raw_st[6:13].astype(np.float64)
-                    q_cl = float(use_cfg["q_clamp_rad"])
-                    dq_step_p = pending_dq.pop(0)
-                    if cur_phase == 4:
-                        # Real-robot motor-torque Jacobian admittance compliance (100% robot-only SDK2 torques + URDF J):
-                        # caps contact force safely below 25N guard without ever using privileged pose.
-                        tau_cur = np.asarray(task.d.actuator_force[rcu.ARM_ACT_SLICE], dtype=np.float64)
-                        J_rob = rcu.compute_robot_tcp_jacobian(task)
-                        f_est3 = np.linalg.lstsq(J_rob.T, -(tau_cur - tau_p4_free), rcond=1e-2)[0][:3]
-                        f_est_n = float(np.linalg.norm(f_est3))
-                        if f_est_n > 15.0:
-                            q_tgt = q_cur + 0.40 * (q_tgt - q_cur)
-                            dq_step_p = np.zeros_like(dq_step_p)
-                            q_cl = min(q_cl, 0.0060)
-                        elif f_est_n > 11.0:
-                            q_cl = min(q_cl, 0.0110)
-                    q_tgt = q_cur + np.clip((q_tgt + dq_step_p) - q_cur, -q_cl, q_cl)
-                    cmd = np.zeros(8, dtype=np.float32)
-                    cmd[:7] = q_tgt.astype(np.float32)
-                    cmd[7] = 0.98
-                    if (float(np.min(fq_margin)) < 0.00018 and float(np.sum(fq_margin)) < 0.00085) or float(np.min(fq_margin)) < 0.00010:
-                        cmd[7] = 0.0
-                    steps_since_vla += 1
+                            with torch.no_grad():
+                                l_t = torch.from_numpy(l_crop[None]).to(device) if l_crop is not None else None
+                                act6 = use_actor(
+                                    torch.from_numpy(cached_z[None]).to(device),
+                                    torch.from_numpy(p_feat[None]).to(device),
+                                    torch.from_numpy(cached_ref_rel32[None]).to(device),
+                                    torch.from_numpy(w_crop[None]).to(device),
+                                    torch.from_numpy(f_crop[None]).to(device),
+                                    l_t,
+                                )[0].cpu().numpy().astype(np.float32)
+                            dq = step_persistent_qtgt_dq(
+                                task, act6,
+                                scale_xyz_m=use_cfg["scale_xyz_m"],
+                                scale_rot_rad=use_cfg["scale_rot_rad"],
+                                max_dq_rad=0.025,
+                                exact_nullspace=use_cfg["exact_nullspace"],
+                            )
+                            prev_act6 = act6.copy()
+                            pending_dq = [0.5 * dq, 0.5 * dq]
+                        q_cur = raw_st[6:13].astype(np.float64)
+                        q_cl = float(use_cfg["q_clamp_rad"])
+                        dq_step_p = pending_dq.pop(0)
+                        if cur_phase == 4:
+                            # Real-robot motor-torque Jacobian admittance compliance (100% robot-only SDK2 torques + URDF J):
+                            # normal descent & leaf-spring seating stay <= 3.5 N (full authority); smooth bleed above 5.5 N
+                            # prevents rigid bottom-stop spikes from exceeding the 25 N guard without starving spring entry.
+                            tau_cur = np.asarray(task.d.actuator_force[rcu.ARM_ACT_SLICE], dtype=np.float64)
+                            J_rob = rcu.compute_robot_tcp_jacobian(task)
+                            f_est3 = np.linalg.lstsq(J_rob.T, -(tau_cur - tau_p4_free), rcond=1e-2)[0][:3]
+                            f_est_n = float(np.linalg.norm(f_est3))
+                            if f_est_n > 5.5:
+                                q_tgt = q_cur + 0.80 * (q_tgt - q_cur)
+                                dq_step_p = np.zeros_like(dq_step_p)
+                                q_cl = min(q_cl, 0.0090)
+                        q_tgt = q_cur + np.clip((q_tgt + dq_step_p) - q_cur, -q_cl, q_cl)
+                        cmd = np.zeros(8, dtype=np.float32)
+                        cmd[:7] = q_tgt.astype(np.float32)
+                        cmd[7] = 0.98
+                        fq_min_thr = 0.00014 if cur_phase == 7 else 0.00010
+                        if (fq_min_now < 0.00018 and float(np.sum(fq_margin)) < 0.00085) or fq_min_now < fq_min_thr or fq_slam_guard:
+                            cmd[7] = 0.0
+                        steps_since_vla += 1
+                        phase_step += 1
                 else:
                     if not pending:
                         if tail_p13 is not None and cur_phase >= 8:
